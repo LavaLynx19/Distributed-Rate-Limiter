@@ -2,6 +2,31 @@
 
 A production-grade API Gateway rate limiter with implementations in **Node.js** and **Go**, backed by **Redis Lua scripts** for atomic, distributed enforcement.
 
+## Overview
+
+APIs need protection from abuse, runaway clients, and DDoS floods — while still enforcing accurate usage quotas for billing. This project implements a **distributed rate limiter** designed to sit at the API Gateway layer, intercepting every request before it reaches backend services.
+
+**Why this exists:**
+- **Usage enforcement** — Monetized APIs need exact request counting that can't be gamed by rotating across load-balanced servers
+- **Abuse protection** — High-traffic APIs need sub-millisecond rate checks that don't bottleneck on a central store
+- **One system, two modes** — Rather than choosing between accuracy and speed, this limiter offers both as configurable enforcement modes (Strict and Loose)
+
+**What makes it different:**
+- A single **Redis Lua script** handles all rate-limit logic atomically — no race conditions, no distributed locks
+- **Fail-open resilience** — if Redis goes down, traffic flows through instead of failing closed
+- Uses **Redis server time** exclusively to prevent clock drift across gateway instances
+- **Zero garbage collection** — Redis TTLs auto-expire old segments with no background cleanup
+
+## Tech Stack
+
+| Layer | Technology | Role |
+|---|---|---|
+| Gateway (Node.js) | Express + ioredis | HTTP server, Redis client with Lua EVALSHA |
+| Gateway (Go) | net/http + go-redis | HTTP server, Redis client (planned) |
+| State Store | Redis | Central counter store, Lua script execution |
+| Atomic Logic | Redis Lua Scripts | Single-script check-and-increment |
+| Load Testing | autocannon | HTTP benchmarking with programmatic API |
+
 ## How It Works
 
 ### The Algorithm: Sliding Window Counter
@@ -81,6 +106,56 @@ When blocked (HTTP 429):
 X-RateLimit-Remaining: 0
 Retry-After: 45                 # Seconds until capacity frees up
 ```
+
+## Performance Targets
+
+| Metric | Strict Mode | Loose Mode |
+|---|---|---|
+| **p99 Latency** | < 5ms (bound by Redis RTT) | Sub-millisecond (local map lookup) |
+| **Counting Accuracy** | 100% exact | ~95-99% (transient lag across servers) |
+| **Throughput** | Thousands RPS per gateway | Millions RPS per gateway |
+| **Concurrency Safety** | Zero over-admission (Lua atomicity) | Eventual consistency via batch sync |
+| **Fail-Open Timeout** | 5ms — allows request if Redis is slow/down | N/A — no Redis in hot path |
+
+**Infrastructure SLOs:**
+
+| Target | Value | Mechanism |
+|---|---|---|
+| Redis key auto-expiry | 300s TTL per segment | `SETEX` in Lua script — zero GC overhead |
+| Clock drift prevention | 0ms | All time derived from Redis `TIME` command |
+| Batch flush interval (Loose) | Every 500ms or 50 requests | Whichever threshold is hit first |
+| Memory cleanup (Loose) | 5-minute idle prune | Stale heap entries removed each flush cycle |
+
+## Observability
+
+### Rate-Limit Headers
+
+Every rate-limited response includes standard headers for client-side awareness:
+
+| Header | When | Description |
+|---|---|---|
+| `X-RateLimit-Limit` | All responses | Max requests allowed per 5-minute window |
+| `X-RateLimit-Remaining` | All responses | Requests left before throttling |
+| `X-RateLimit-Reset` | All responses | Unix timestamp when the oldest segment expires |
+| `Retry-After` | 429 only | Seconds until capacity frees up |
+
+### Diagnostic Endpoints
+
+| Endpoint | What it tells you |
+|---|---|
+| `GET /api/open/health` | Redis connection status — confirms whether rate limiting is active or in fail-open mode |
+| `GET /api/open/stats` | Per-identifier heap buffer counts — shows local request tallies and flush state (loose mode) |
+
+## Project Status
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1. Architecture | Algorithm design, Redis schema, resilience strategy | Complete |
+| 2. Node.js | Express server, strict/loose middleware, Lua script, load tests | Complete |
+| 3. Go | net/http server, go-redis client, benchmark vs Node.js | Planned |
+| 4. Finalization | Docker side-by-side setup, final performance review | Planned |
+
+See [PLAN.md](./PLAN.md) for the detailed task breakdown.
 
 ## Quick Start
 
