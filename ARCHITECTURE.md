@@ -233,7 +233,159 @@ Depending on the business use case, this architecture supports two distinct oper
 
 ---
 
-## 7. Improvements or Future Scope
+## 7. Additional Rate Limiting Algorithms
+
+<!-- IMPL_TAG: additional_algorithms -->
+
+In addition to the Sliding Window Counter, this project implements two more rate limiting algorithms as separate middlewares. Each algorithm serves different use cases and has distinct performance characteristics.
+
+### Algorithm Comparison
+
+| Property | Sliding Window Counter | Token Bucket | Leaky Bucket |
+| :--- | :--- | :--- | :--- |
+| **Best For** | Quota enforcement over time windows | Burst-tolerant API rate limiting | Steady-rate output enforcement |
+| **Burst Handling** | Smoothed (segments prevent boundary bursts) | Allows controlled bursts (spend saved tokens) | No bursts — constant drain rate |
+| **Memory Per User** | 5 String keys (one per segment) | 1 Hash key (2 fields) | 1 Hash key (2 fields) |
+| **Enforcement Modes** | Strict + Loose | Strict only | Strict only |
+| **Parameters** | `max_limit`, `window_segments` | `capacity`, `refill_rate` | `capacity`, `leak_rate` |
+| **Time Precision** | Seconds (60s segments) | Sub-second (microseconds) | Sub-second (microseconds) |
+
+> **Why Strict Only for Token Bucket & Leaky Bucket?** These algorithms maintain continuous state (token count, water level) that changes with every request. In loose mode, each gateway server would maintain its own bucket state, effectively multiplying the rate limit by the number of servers. The drift is unbounded — unlike the sliding window counter where loose mode error is bounded to ~5% overshoot.
+
+### Token Bucket Algorithm
+
+**Concept:** Users start with a full bucket of tokens. Each request consumes one token. Tokens refill at a steady rate. When the bucket is empty, requests are blocked until tokens refill.
+
+**Parameters:**
+* `capacity` — Maximum tokens the bucket can hold (also the burst limit)
+* `refill_rate` — Tokens added per second
+
+**Redis Schema:**
+| Field | Format | Example |
+| :--- | :--- | :--- |
+| Key | `token_bucket::{identifier}` | `token_bucket::user_123` |
+| Hash Fields | `tokens` (float), `last_refill` (float timestamp) | `tokens: 7.5`, `last_refill: 1710000300.123` |
+| TTL | `ceil(capacity / refill_rate)` seconds | Auto-expires idle users |
+
+```
+PSEUDOCODE: token_bucket.lua
+─────────────────────────────────────────────────────
+INPUTS:
+  KEYS[1]  = identifier (user_id or ip_address)
+  ARGV[1]  = capacity (e.g., 10)
+  ARGV[2]  = refill_rate (e.g., 1 token/sec)
+
+STEP 1 — Get Server Time (sub-second precision):
+  now = redis.call('TIME')[1] + redis.call('TIME')[2] / 1e6
+
+STEP 2 — Read State:
+  HMGET token_bucket::{identifier} → tokens, last_refill
+
+STEP 3 — Initialize First Request:
+  IF state is nil: tokens = capacity, last_refill = now
+
+STEP 4 — Refill Tokens:
+  elapsed = now - last_refill
+  tokens = MIN(capacity, tokens + elapsed * refill_rate)
+
+STEP 5 — Enforce Limit:
+  IF tokens < 1:
+    RETURN { "BLOCKED", 0, ceil((1 - tokens) / refill_rate) }
+
+STEP 6 — Consume Token:
+  tokens = tokens - 1
+  HMSET + EXPIRE
+
+STEP 7 — Return Success:
+  RETURN { "ALLOWED", floor(tokens), reset_ttl }
+─────────────────────────────────────────────────────
+```
+
+### Leaky Bucket Algorithm
+
+**Concept:** Requests fill a bucket that leaks at a constant rate. If the bucket overflows, requests are blocked. This enforces a perfectly steady output rate regardless of input burst patterns.
+
+**Parameters:**
+* `capacity` — Maximum bucket size (queue depth)
+* `leak_rate` — Requests drained per second
+
+**Redis Schema:**
+| Field | Format | Example |
+| :--- | :--- | :--- |
+| Key | `leaky_bucket::{identifier}` | `leaky_bucket::user_123` |
+| Hash Fields | `water_level` (float), `last_leak` (float timestamp) | `water_level: 3.2`, `last_leak: 1710000300.456` |
+| TTL | `ceil(capacity / leak_rate)` seconds | Auto-expires idle users |
+
+```
+PSEUDOCODE: leaky_bucket.lua
+─────────────────────────────────────────────────────
+INPUTS:
+  KEYS[1]  = identifier (user_id or ip_address)
+  ARGV[1]  = capacity (e.g., 10)
+  ARGV[2]  = leak_rate (e.g., 1 request/sec)
+
+STEP 1 — Get Server Time (sub-second precision):
+  now = redis.call('TIME')[1] + redis.call('TIME')[2] / 1e6
+
+STEP 2 — Read State:
+  HMGET leaky_bucket::{identifier} → water_level, last_leak
+
+STEP 3 — Initialize First Request:
+  IF state is nil: water_level = 0, last_leak = now
+
+STEP 4 — Drain Bucket:
+  elapsed = now - last_leak
+  water_level = MAX(0, water_level - elapsed * leak_rate)
+
+STEP 5 — Enforce Limit:
+  IF water_level + 1 > capacity:
+    RETURN { "BLOCKED", 0, ceil((water_level + 1 - capacity) / leak_rate) }
+
+STEP 6 — Add Water:
+  water_level = water_level + 1
+  HMSET + EXPIRE
+
+STEP 7 — Return Success:
+  RETURN { "ALLOWED", floor(capacity - water_level), reset_ttl }
+─────────────────────────────────────────────────────
+```
+
+### Request Lifecycle (Token Bucket / Leaky Bucket)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as API Gateway
+    participant R as Redis (Central State)
+    participant B as Backend Services
+
+    C->>GW: HTTP Request
+    GW->>GW: Extract Identifier
+
+    GW->>R: [Sync] EVAL Lua Script (HMGET, compute, HMSET)
+    alt Capacity Available (tokens >= 1 / water_level + 1 <= capacity)
+        R-->>GW: Return ALLOWED (remaining count)
+        GW->>B: Proxy Request
+        B-->>GW: HTTP 200 OK
+        GW-->>C: HTTP 200 OK + X-RateLimit Headers
+    else Capacity Exhausted
+        R-->>GW: Return BLOCKED (0 remain, retry_after)
+        GW-->>C: HTTP 429 Too Many Requests + Retry-After
+    end
+```
+
+### Key Design Differences from Sliding Window Counter
+
+| Aspect | Sliding Window Counter | Token Bucket / Leaky Bucket |
+| :--- | :--- | :--- |
+| **Redis Data Type** | String keys (one per segment) | Hash (single key, multiple fields) |
+| **Atomicity** | `MGET` across 5 keys | `HMGET` + `HMSET` on 1 key |
+| **Garbage Collection** | Redis TTL on each segment key | Redis `EXPIRE` on hash key |
+| **Cluster Compatibility** | Needs hash tags (5 keys may hash to different slots) | Single key per user — no slot issues |
+| **State Model** | Additive counters (increment only) | Continuous state (refill/drain over time) |
+
+---
+
+## 8. Improvements or Future Scope
 
 <!-- IMPL_TAG: future_scope -->
 

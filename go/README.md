@@ -26,6 +26,10 @@ The server starts on port 3000. If Redis is unavailable, it runs in fail-open mo
 | `REDIS_HOST` | `127.0.0.1` | Redis host address |
 | `REDIS_PORT` | `6379` | Redis port |
 | `RATE_LIMIT_MAX` | `100` | Max requests per 5-minute rolling window |
+| `TOKEN_BUCKET_CAPACITY` | `10` | Token bucket max tokens (burst limit) |
+| `TOKEN_BUCKET_REFILL_RATE` | `1` | Token bucket refill rate (tokens/sec) |
+| `LEAKY_BUCKET_CAPACITY` | `10` | Leaky bucket max size (queue depth) |
+| `LEAKY_BUCKET_LEAK_RATE` | `1` | Leaky bucket drain rate (requests/sec) |
 | `PORT` | `3000` | Server listening port |
 
 ## Planned Project Structure
@@ -40,19 +44,27 @@ internal/
   redis/
     client.go                  # go-redis connection + Lua script loading
     sliding_window.go          # Lua execution wrapper, fail-open timeout
+    token_bucket.go            # Token bucket Lua execution wrapper
+    leaky_bucket.go            # Leaky bucket Lua execution wrapper
   middleware/
     identifier.go              # Extracts user ID from request (API key / IP)
     headers.go                 # Sets X-RateLimit-* and Retry-After headers
     strict.go                  # HTTP middleware — sync Redis per request
     loose.go                   # HTTP middleware — local map, async Redis
+    token_bucket.go            # HTTP middleware — token bucket strict mode
+    leaky_bucket.go            # HTTP middleware — leaky bucket strict mode
   buffer/
     heap.go                    # Local map buffer + flush goroutine
   routes/
     strict.go                  # Strict-mode demo endpoints
     loose.go                   # Loose-mode demo endpoints
+    token_bucket.go            # Token bucket demo endpoints
+    leaky_bucket.go            # Leaky bucket demo endpoints
     health.go                  # Health check + stats endpoints
 lua/
   sliding_window.lua           # Atomic Lua script (shared with Node implementation)
+  token_bucket.lua             # Token bucket Lua script (shared with Node implementation)
+  leaky_bucket.lua             # Leaky bucket Lua script (shared with Node implementation)
 ```
 
 ## API Endpoints
@@ -61,9 +73,11 @@ lua/
 
 | Endpoint | Mode | Description |
 |---|---|---|
-| `GET /api/strict/resource` | Strict | Synchronous Redis check per request |
-| `GET /api/loose/resource` | Loose | Local map check, async Redis sync |
-| `GET /api/loose/burst` | Loose | Burst traffic simulation endpoint |
+| `GET /api/strict/resource` | Strict | Synchronous Redis check per request (sliding window) |
+| `GET /api/loose/resource` | Loose | Local map check, async Redis sync (sliding window) |
+| `GET /api/loose/burst` | Loose | Burst traffic simulation endpoint (sliding window) |
+| `GET /api/token-bucket/resource` | Strict | Token bucket — burst-tolerant rate limiting |
+| `GET /api/leaky-bucket/resource` | Strict | Leaky bucket — steady-rate enforcement |
 
 ### Open (No Rate Limiting)
 
@@ -74,7 +88,7 @@ lua/
 
 ## Implementation Notes
 
-- **Lua script:** The same `sliding_window.lua` atomic script used by the Node implementation will be reused. Both strict and loose modes call it with different `batch_count` values.
+- **Lua scripts:** The same `sliding_window.lua`, `token_bucket.lua`, and `leaky_bucket.lua` atomic scripts used by the Node implementation will be reused. Sliding window strict and loose modes call their script with different `batch_count` values. Token bucket and leaky bucket are strict-only.
 - **Concurrency:** Loose mode uses a `sync.RWMutex`-guarded map with a background flush goroutine (replaces Node's `setInterval` pattern).
 - **Fail-open:** Redis calls use `context.WithTimeout` (5ms budget) — if Redis is down or slow, requests pass through.
 - **Idiomatic Go:** Uses `net/http` middleware chaining, struct-based dependency injection, and goroutines for background work.

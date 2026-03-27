@@ -24,6 +24,10 @@ The server starts on port 3000. If Redis is unavailable, it runs in fail-open mo
 | `REDIS_HOST` | `127.0.0.1` | Redis host address |
 | `REDIS_PORT` | `6379` | Redis port |
 | `RATE_LIMIT_MAX` | `100` | Max requests per 5-minute rolling window |
+| `TOKEN_BUCKET_CAPACITY` | `10` | Token bucket max tokens (burst limit) |
+| `TOKEN_BUCKET_REFILL_RATE` | `1` | Token bucket refill rate (tokens/sec) |
+| `LEAKY_BUCKET_CAPACITY` | `10` | Leaky bucket max size (queue depth) |
+| `LEAKY_BUCKET_LEAK_RATE` | `1` | Leaky bucket drain rate (requests/sec) |
 | `PORT` | `3000` | Server listening port |
 
 You can also create a `.env` file — dotenv is loaded at startup.
@@ -33,19 +37,27 @@ You can also create a `.env` file — dotenv is loaded at startup.
 ```
 server.js                        # Express entry point, graceful shutdown
 lua/
-  sliding_window.lua             # Atomic Lua script (shared across modes)
+  sliding_window.lua             # Sliding window counter Lua script (shared across modes)
+  token_bucket.lua               # Token bucket Lua script (strict mode only)
+  leaky_bucket.lua               # Leaky bucket Lua script (strict mode only)
 lib/
   config.js                      # Central config (env vars + defaults)
   redis-client.js                # ioredis connection + Lua defineCommand
-  sliding-window-counter.js      # Calls Lua, parses result, handles fail-open
+  sliding-window-counter.js      # Sliding window: calls Lua, parses result, fail-open
+  token-bucket.js                # Token bucket: calls Lua, parses result, fail-open
+  leaky-bucket.js                # Leaky bucket: calls Lua, parses result, fail-open
   identifier.js                  # Extracts user ID from request (API key / IP)
   headers.js                     # Sets X-RateLimit-* and Retry-After headers
-  strict-middleware.js            # Express middleware — sync Redis per request
+  strict-middleware.js            # Express middleware — sliding window strict mode
+  token-bucket-middleware.js      # Express middleware — token bucket strict mode
+  leaky-bucket-middleware.js      # Express middleware — leaky bucket strict mode
   heap-buffer.js                 # Local Map buffer + flush loop for loose mode
-  loose-middleware.js             # Express middleware — local heap, async Redis
+  loose-middleware.js             # Express middleware — sliding window loose mode
 routes/
   sample-api.js                  # Strict-mode demo endpoints + health/stats
   loose-api.js                   # Loose-mode demo endpoints
+  token-bucket-api.js            # Token bucket demo endpoints
+  leaky-bucket-api.js            # Leaky bucket demo endpoints
 test/
   load-test.js                   # autocannon-based load tests
 ```
@@ -56,9 +68,11 @@ test/
 
 | Endpoint | Mode | Description |
 |---|---|---|
-| `GET /api/strict/resource` | Strict | Synchronous Redis check per request |
-| `GET /api/loose/resource` | Loose | Local heap check, async Redis sync |
-| `GET /api/loose/burst` | Loose | Burst traffic simulation endpoint |
+| `GET /api/strict/resource` | Strict | Synchronous Redis check per request (sliding window) |
+| `GET /api/loose/resource` | Loose | Local heap check, async Redis sync (sliding window) |
+| `GET /api/loose/burst` | Loose | Burst traffic simulation endpoint (sliding window) |
+| `GET /api/token-bucket/resource` | Strict | Token bucket — burst-tolerant rate limiting |
+| `GET /api/leaky-bucket/resource` | Strict | Leaky bucket — steady-rate enforcement |
 
 ### Open (No Rate Limiting)
 
@@ -87,9 +101,35 @@ for i in $(seq 1 200); do
 done
 ```
 
+### Manual — Token Bucket
+
+```bash
+# Send 12 requests (capacity=10) — first 10 get 200, last 2 get 429
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:3000/api/token-bucket/resource
+done
+# Wait 3 seconds for tokens to refill, then send 3 more — should get 200
+sleep 3 && for i in $(seq 1 3); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:3000/api/token-bucket/resource
+done
+```
+
+### Manual — Leaky Bucket
+
+```bash
+# Send 12 requests (capacity=10) — first 10 get 200, last 2 get 429
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:3000/api/leaky-bucket/resource
+done
+# Wait 3 seconds for bucket to drain, then send 3 more — should get 200
+sleep 3 && for i in $(seq 1 3); do
+  curl -s -o /dev/null -w "%{http_code} " http://localhost:3000/api/leaky-bucket/resource
+done
+```
+
 ### Manual — Fail-Open
 
-Stop Redis, then send requests to the strict endpoint — all should return 200.
+Stop Redis, then send requests to any rate-limited endpoint — all should return 200.
 
 ### Load Tests
 
@@ -101,15 +141,25 @@ redis-cli FLUSHDB
 npm run test:load
 ```
 
-The load test suite runs three scenarios:
-1. **Strict correctness** — 150 sequential requests, verifies exactly 100 pass
-2. **Strict concurrency** — 200 requests across 10 connections, verifies Lua atomicity (no over-admission)
+The load test suite runs seven scenarios:
+1. **Strict correctness** — 150 sequential requests, verifies exactly 100 pass (sliding window)
+2. **Strict concurrency** — 200 requests across 10 connections, verifies Lua atomicity (sliding window)
 3. **Loose throughput** — 50 connections for 10 seconds, measures RPS and p99 latency
+4. **Token bucket correctness** — 15 sequential requests (capacity=10), verifies blocking
+5. **Token bucket refill** — Waits for tokens to refill, verifies recovery
+6. **Leaky bucket correctness** — 15 sequential requests (capacity=10), verifies blocking
+7. **Leaky bucket drain** — Waits for bucket to drain, verifies recovery
 
 ## Module Walkthrough
 
 ### `lua/sliding_window.lua`
-The single most critical file. All rate-limiting correctness depends on this script executing atomically inside Redis. It serves both strict and loose modes — the `batch_count` argument (1 for strict, N for loose) is the only difference.
+Sliding window counter Lua script. Executes atomically inside Redis. Serves both strict and loose modes — the `batch_count` argument (1 for strict, N for loose) is the only difference. Uses 5 String keys per user (one per 60s segment).
+
+### `lua/token_bucket.lua`
+Token bucket Lua script. Tracks tokens and last refill time in a Redis Hash per user. Refills tokens based on elapsed time, consumes 1 per request. Strict mode only.
+
+### `lua/leaky_bucket.lua`
+Leaky bucket Lua script. Tracks water level and last leak time in a Redis Hash per user. Drains at a constant rate, rejects on overflow. Strict mode only.
 
 ### `lib/redis-client.js`
 Creates the ioredis client and registers the Lua script via `defineCommand`. This gives us automatic `EVALSHA`/`EVAL` fallback — the first call caches the script SHA in Redis, all subsequent calls use `EVALSHA` (no script re-transmission).

@@ -6,6 +6,8 @@ import { config } from './config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const luaScript = readFileSync(join(__dirname, '..', 'lua', 'sliding_window.lua'), 'utf-8');
+const tokenBucketLua = readFileSync(join(__dirname, '..', 'lua', 'token_bucket.lua'), 'utf-8');
+const leakyBucketLua = readFileSync(join(__dirname, '..', 'lua', 'leaky_bucket.lua'), 'utf-8');
 
 const redis = new Redis({
   host: config.redis.host,
@@ -19,10 +21,20 @@ const redis = new Redis({
   lazyConnect: true,
 });
 
-// Register the Lua script as a custom command — ioredis handles EVALSHA/EVAL fallback
+// Register Lua scripts as custom commands — ioredis handles EVALSHA/EVAL fallback
 redis.defineCommand('rateLimitCheck', {
   numberOfKeys: 1,
   lua: luaScript,
+});
+
+redis.defineCommand('tokenBucketCheck', {
+  numberOfKeys: 1,
+  lua: tokenBucketLua,
+});
+
+redis.defineCommand('leakyBucketCheck', {
+  numberOfKeys: 1,
+  lua: leakyBucketLua,
 });
 
 redis.on('error', (err) => {

@@ -14,6 +14,14 @@ export const config = {
     batchThreshold: parseInt(process.env.RATE_LIMIT_MAX, 10) / 2 || 50, // flush after N local increments
     flushIntervalMs: 500, // flush every 500ms
   },
+  tokenBucket: {
+    capacity: parseInt(process.env.TOKEN_BUCKET_CAPACITY, 10) || 10,
+    refillRate: parseFloat(process.env.TOKEN_BUCKET_REFILL_RATE) || 1, // tokens/sec
+  },
+  leakyBucket: {
+    capacity: parseInt(process.env.LEAKY_BUCKET_CAPACITY, 10) || 10,
+    leakRate: parseFloat(process.env.LEAKY_BUCKET_LEAK_RATE) || 1, // requests drained/sec
+  },
   server: {
     port: parseInt(process.env.PORT, 10) || 3000,
   },

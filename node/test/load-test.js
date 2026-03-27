@@ -68,6 +68,78 @@ async function looseThroughputTest() {
   console.log(`  Latency target (<5ms): ${p99 < 5 ? 'PASS' : 'ABOVE TARGET'}`);
 }
 
+async function tokenBucketCorrectnessTest() {
+  console.log('\n=== Test 4: Token Bucket Correctness ===');
+  console.log('Sending 15 sequential requests (capacity=10, refill=1/sec)...\n');
+
+  const result = await run({
+    url: `${BASE_URL}/api/token-bucket/resource`,
+    connections: 1,
+    amount: 15,
+    pipelining: 1,
+  });
+
+  const ok = result['2xx'];
+  const blocked = result['4xx'];
+  console.log(`\n  2xx responses: ${ok} (expected: 10)`);
+  console.log(`  4xx responses: ${blocked} (expected: 5)`);
+  console.log(`  Result: ${ok === 10 && blocked === 5 ? 'PASS' : 'CHECK — counts may vary based on refill timing'}`);
+}
+
+async function tokenBucketRefillTest() {
+  console.log('\n=== Test 5: Token Bucket Refill ===');
+  console.log('Waiting 5s for tokens to refill, then sending 5 requests...\n');
+
+  await new Promise(r => setTimeout(r, 5000));
+
+  const result = await run({
+    url: `${BASE_URL}/api/token-bucket/resource`,
+    connections: 1,
+    amount: 5,
+    pipelining: 1,
+  });
+
+  const ok = result['2xx'];
+  console.log(`\n  2xx responses: ${ok} (expected: 5 — tokens refilled)`);
+  console.log(`  Result: ${ok === 5 ? 'PASS' : 'CHECK — refill may still be catching up'}`);
+}
+
+async function leakyBucketCorrectnessTest() {
+  console.log('\n=== Test 6: Leaky Bucket Correctness ===');
+  console.log('Sending 15 sequential requests (capacity=10, leak=1/sec)...\n');
+
+  const result = await run({
+    url: `${BASE_URL}/api/leaky-bucket/resource`,
+    connections: 1,
+    amount: 15,
+    pipelining: 1,
+  });
+
+  const ok = result['2xx'];
+  const blocked = result['4xx'];
+  console.log(`\n  2xx responses: ${ok} (expected: 10)`);
+  console.log(`  4xx responses: ${blocked} (expected: 5)`);
+  console.log(`  Result: ${ok === 10 && blocked === 5 ? 'PASS' : 'CHECK — counts may vary based on drain timing'}`);
+}
+
+async function leakyBucketDrainTest() {
+  console.log('\n=== Test 7: Leaky Bucket Drain ===');
+  console.log('Waiting 5s for bucket to drain, then sending 5 requests...\n');
+
+  await new Promise(r => setTimeout(r, 5000));
+
+  const result = await run({
+    url: `${BASE_URL}/api/leaky-bucket/resource`,
+    connections: 1,
+    amount: 5,
+    pipelining: 1,
+  });
+
+  const ok = result['2xx'];
+  console.log(`\n  2xx responses: ${ok} (expected: 5 — bucket drained)`);
+  console.log(`  Result: ${ok === 5 ? 'PASS' : 'CHECK — drain may still be catching up'}`);
+}
+
 async function main() {
   console.log('Distributed Rate Limiter — Load Tests');
   console.log(`Target: ${BASE_URL}`);
@@ -84,15 +156,21 @@ async function main() {
 
     await strictConcurrencyTest();
     await looseThroughputTest();
+    await tokenBucketCorrectnessTest();
+    await tokenBucketRefillTest();
+    await leakyBucketCorrectnessTest();
+    await leakyBucketDrainTest();
   } catch (err) {
     console.error('Test failed:', err.message);
     process.exit(1);
   }
 
-  console.log('\n=== Test 4: Fail-Open (manual) ===');
+  console.log('\n=== Test 8: Fail-Open (manual) ===');
   console.log('To test fail-open: stop Redis, then run:');
   console.log(`  curl -s -o /dev/null -w "%{http_code}" ${BASE_URL}/api/strict/resource`);
-  console.log('Expected: 200 (fail-open)\n');
+  console.log(`  curl -s -o /dev/null -w "%{http_code}" ${BASE_URL}/api/token-bucket/resource`);
+  console.log(`  curl -s -o /dev/null -w "%{http_code}" ${BASE_URL}/api/leaky-bucket/resource`);
+  console.log('Expected: 200 (fail-open) for all endpoints\n');
 
   process.exit(0);
 }

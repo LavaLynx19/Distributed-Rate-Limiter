@@ -6,6 +6,8 @@ import { redis } from './lib/redis-client.js';
 import { startFlushLoop, stopFlushLoop } from './lib/heap-buffer.js';
 import sampleApi from './routes/sample-api.js';
 import looseApi from './routes/loose-api.js';
+import tokenBucketApi from './routes/token-bucket-api.js';
+import leakyBucketApi from './routes/leaky-bucket-api.js';
 
 const app = express();
 
@@ -13,6 +15,8 @@ app.set('trust proxy', true);
 
 app.use(sampleApi);
 app.use(looseApi);
+app.use(tokenBucketApi);
+app.use(leakyBucketApi);
 
 async function start() {
   try {
