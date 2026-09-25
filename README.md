@@ -152,14 +152,45 @@ Every rate-limited response includes standard headers for client-side awareness:
 |---|---|---|
 | 1. Architecture | Algorithm design, Redis schema, resilience strategy | Complete |
 | 2. Node.js | Express server, strict/loose middleware, Lua script, load tests | Complete |
-| 3. Go | net/http server, go-redis client, benchmark vs Node.js | Planned |
-| 4. Finalization | Docker side-by-side setup, final performance review | Planned |
+| 3. Go | net/http server, go-redis client, benchmark vs Node.js | Complete |
+| 3b. Correctness fixes | Bug-fix pass on both gateways, re-benchmark | Complete |
+| 4. Finalization | Docker side-by-side setup, final performance review | Complete — [results](./go/RESULTS.md) |
 
 See [PLAN.md](./PLAN.md) for the detailed task breakdown.
 
 ## Quick Start
 
-### Prerequisites
+### Docker (both gateways, shared Redis, nginx)
+
+```bash
+docker compose up -d --build
+```
+
+| Port | Serves |
+|---|---|
+| `8080` | nginx, round-robin across both gateways (one shared quota) |
+| `8081` / `8082` | nginx → Node / Go only |
+| `3000` / `3001` | Node / Go directly |
+
+Every response through nginx carries `X-Served-By: node|go`. The gateways trust `X-Forwarded-For` only from nginx, so a forged header on any port is ignored.
+
+```bash
+# One quota across two runtimes: exactly 100 of 105 admitted, split between Node and Go
+for i in $(seq 1 105); do
+  curl -s -o /dev/null -D - -H "x-api-key: demo" http://localhost:8080/api/strict/resource \
+    | tr -d '\r' | awk '/^HTTP/{c=$2} /^[Xx]-[Ss]erved-[Bb]y/{print c, $2}'
+done | sort | uniq -c
+```
+
+Isolated, CPU-pinned benchmark (stop the default stack first):
+
+```bash
+docker compose stop && bench/docker-bench.sh     # results in bench/results/<timestamp>/
+```
+
+See [ARCHITECTURE.md §9](./ARCHITECTURE.md) for the topology and its trade-offs.
+
+### Prerequisites (native)
 - **Redis** running on localhost:6379
 
 ### Node.js
@@ -167,6 +198,13 @@ See [PLAN.md](./PLAN.md) for the detailed task breakdown.
 ```bash
 cd node && npm install && npm start
 # Server starts on port 3000
+```
+
+### Go
+
+```bash
+cd go && go run ./cmd/server
+# Server starts on port 3000 (set PORT to change)
 ```
 
 ### Try It Out
@@ -181,9 +219,13 @@ curl -i http://localhost:3000/api/strict/resource
 curl -i http://localhost:3000/api/loose/resource
 ```
 
-**Authenticated request** — rate-limit by API key instead of IP:
+**Authenticated request** — rate-limit by a registered API key instead of IP. Unregistered keys are ignored and limited by IP, so made-up keys can't mint fresh quotas (see [ARCHITECTURE.md §10](./ARCHITECTURE.md)):
 ```bash
-curl -i -H "x-api-key: user_123" http://localhost:3000/api/strict/resource
+cd go
+go run ./cmd/keyctl tenant set acme -plan paid -keys 3 -mode isolated   # or -mode pooled
+KEY=$(go run ./cmd/keyctl key create acme)                               # shown once; only its hash is stored
+curl -i -H "x-api-key: $KEY" http://localhost:3000/api/strict/resource   # X-RateLimit-Limit: 1000
+# In Docker: docker compose exec go /app/keyctl ...
 ```
 
 **Trigger a 429** — exceed the limit (default 100):
@@ -215,10 +257,10 @@ curl http://localhost:3000/api/open/stats
 
 | Directory | Stack | Status |
 |---|---|---|
-| [`node/`](./node/) | Express + ioredis | Complete |
-| [`go/`](./go/) | net/http + go-redis | Planned |
+| [`node/`](./node/) | Express + ioredis | Complete — [results](./node/RESULTS.md) |
+| [`go/`](./go/) | net/http + go-redis | Complete — [results and Go vs Node comparison](./go/RESULTS.md) |
 
-Both implementations share the same Lua script, Redis schema, and enforcement logic. See each directory's README for setup and usage.
+Both implementations share the Lua scripts in [`lua/`](./lua/), the Redis schema, and the enforcement logic. See each directory's README for setup and usage.
 
 ## Architecture
 

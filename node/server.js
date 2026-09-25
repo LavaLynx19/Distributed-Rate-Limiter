@@ -3,7 +3,7 @@ dotenv.config();
 import express from 'express';
 import { config } from './lib/config.js';
 import { redis } from './lib/redis-client.js';
-import { startFlushLoop, stopFlushLoop } from './lib/heap-buffer.js';
+import { startFlushLoop, stopFlushLoop, drain } from './lib/heap-buffer.js';
 import sampleApi from './routes/sample-api.js';
 import looseApi from './routes/loose-api.js';
 import tokenBucketApi from './routes/token-bucket-api.js';
@@ -11,7 +11,7 @@ import leakyBucketApi from './routes/leaky-bucket-api.js';
 
 const app = express();
 
-app.set('trust proxy', true);
+app.set('trust proxy', config.server.trustProxy);
 
 app.use(sampleApi);
 app.use(looseApi);
@@ -31,11 +31,20 @@ async function start() {
     console.log(`[Server] Listening on port ${config.server.port}`);
   });
 
+  // Stop taking requests first, then write the loose-mode counts still held
+  // in memory, and only then drop the Redis connection.
   function shutdown() {
     console.log('[Server] Shutting down gracefully...');
-    stopFlushLoop();
-    server.close(() => {
-      redis.quit().then(() => process.exit(0)).catch(() => process.exit(1));
+    server.close(async () => {
+      stopFlushLoop();
+      try {
+        await drain();
+        await redis.quit();
+        process.exit(0);
+      } catch (err) {
+        console.error('[Server] Shutdown error:', err.message);
+        process.exit(1);
+      }
     });
   }
 

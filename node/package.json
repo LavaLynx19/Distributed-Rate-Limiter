@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test 'test/unit/*.test.js'",
     "test:load": "node test/load-test.js"
   },
   "dependencies": {

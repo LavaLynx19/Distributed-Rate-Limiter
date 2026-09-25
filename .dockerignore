@@ -1,0 +1,11 @@
+# Both gateway images build from the repo root so the shared lua/ directory is
+# in context. Keep secrets, dependencies and history out of every image.
+**/.env
+**/.env.*
+**/node_modules
+.git
+.claude
+**/*.log
+**/.DS_Store
+go/bin
+bench/results

@@ -1,6 +1,23 @@
 import autocannon from 'autocannon';
+import { parsePlans } from '../lib/registry.js';
+import { provisionKeys, cleanupKeys } from './provision.js';
 
 const BASE_URL = process.env.TEST_URL || 'http://localhost:3000';
+
+// Every test runs as its own registered tenant, on the 'free' plan, so no
+// test inherits another's usage. Unregistered keys would all collapse onto
+// the client IP (ARCHITECTURE.md section 10). A per-run nonce lets the suite
+// be re-run without flushing Redis. Keep PLAN_LIMITS in step with the gateway.
+const PLAN = 'free';
+const MAX_LIMIT = parsePlans(process.env.PLAN_LIMITS || 'free=100,paid=1000').get(PLAN);
+const RUN_ID = Date.now().toString(36);
+const TENANT_PREFIX = `load-test-${RUN_ID}`;
+const TESTS = ['strict-correctness', 'strict-concurrency', 'loose-throughput', 'token-bucket', 'leaky-bucket'];
+let keys = {};
+
+function identity(test) {
+  return { 'x-api-key': keys[test] };
+}
 
 function run(opts) {
   return new Promise((resolve, reject) => {
@@ -14,40 +31,44 @@ function run(opts) {
 
 async function strictCorrectnessTest() {
   console.log('\n=== Test 1: Strict Mode Correctness ===');
-  console.log('Sending 150 sequential requests (limit=100)...\n');
+  console.log(`Sending 150 sequential requests (limit=${MAX_LIMIT})...\n`);
 
   const result = await run({
     url: `${BASE_URL}/api/strict/resource`,
     connections: 1,
     amount: 150,
     pipelining: 1,
+    headers: identity('strict-correctness'),
   });
 
   const ok = result['2xx'];
   const blocked = result['4xx'];
-  console.log(`\n  2xx responses: ${ok} (expected: 100)`);
-  console.log(`  4xx responses: ${blocked} (expected: 50)`);
-  console.log(`  Result: ${ok === 100 && blocked === 50 ? 'PASS' : 'CHECK — counts may vary if window has prior usage'}`);
+  console.log(`\n  2xx responses: ${ok} (expected: ${MAX_LIMIT})`);
+  console.log(`  4xx responses: ${blocked} (expected: ${150 - MAX_LIMIT})`);
+  console.log(`  Result: ${ok === MAX_LIMIT && blocked === 150 - MAX_LIMIT ? 'PASS' : 'FAIL'}`);
 }
 
 async function strictConcurrencyTest() {
   console.log('\n=== Test 2: Strict Mode Concurrency ===');
   console.log('Sending 200 requests across 10 connections...\n');
 
+  // Fresh identifier: exactly MAX_LIMIT must be admitted. Fewer means lost
+  // updates, more means over-admission — either is an atomicity failure.
   const result = await run({
     url: `${BASE_URL}/api/strict/resource`,
     connections: 10,
     amount: 200,
     pipelining: 1,
+    headers: identity('strict-concurrency'),
   });
 
   const ok = result['2xx'];
   const blocked = result['4xx'];
   const total = ok + blocked;
-  console.log(`\n  2xx responses: ${ok}`);
-  console.log(`  4xx responses: ${blocked}`);
+  console.log(`\n  2xx responses: ${ok} (expected: ${MAX_LIMIT})`);
+  console.log(`  4xx responses: ${blocked} (expected: ${200 - MAX_LIMIT})`);
   console.log(`  Total: ${total} (expected: 200)`);
-  console.log(`  Lua atomicity: ${ok <= 100 ? 'PASS — no over-admission' : 'FAIL — over-admitted requests'}`);
+  console.log(`  Lua atomicity: ${ok === MAX_LIMIT && total === 200 ? 'PASS — exactly the limit admitted under concurrency' : 'FAIL'}`);
 }
 
 async function looseThroughputTest() {
@@ -59,13 +80,17 @@ async function looseThroughputTest() {
     connections: 50,
     duration: 10,
     pipelining: 10,
+    headers: identity('loose-throughput'),
   });
 
   const rps = Math.round(result.requests.average);
   const p99 = result.latency.p99;
+  const admitted = result['2xx'];
   console.log(`\n  Avg RPS: ${rps}`);
   console.log(`  p99 Latency: ${p99}ms`);
   console.log(`  Latency target (<5ms): ${p99 < 5 ? 'PASS' : 'ABOVE TARGET'}`);
+  console.log(`  Admitted: ${admitted} of ${admitted + result['4xx']} (limit: ${MAX_LIMIT})`);
+  console.log(`  Local guard: ${admitted <= MAX_LIMIT ? 'PASS — no over-admission' : 'FAIL — over-admitted requests'}`);
 }
 
 async function tokenBucketCorrectnessTest() {
@@ -77,6 +102,7 @@ async function tokenBucketCorrectnessTest() {
     connections: 1,
     amount: 15,
     pipelining: 1,
+    headers: identity('token-bucket'),
   });
 
   const ok = result['2xx'];
@@ -97,6 +123,7 @@ async function tokenBucketRefillTest() {
     connections: 1,
     amount: 5,
     pipelining: 1,
+    headers: identity('token-bucket'),
   });
 
   const ok = result['2xx'];
@@ -113,6 +140,7 @@ async function leakyBucketCorrectnessTest() {
     connections: 1,
     amount: 15,
     pipelining: 1,
+    headers: identity('leaky-bucket'),
   });
 
   const ok = result['2xx'];
@@ -133,6 +161,7 @@ async function leakyBucketDrainTest() {
     connections: 1,
     amount: 5,
     pipelining: 1,
+    headers: identity('leaky-bucket'),
   });
 
   const ok = result['2xx'];
@@ -144,16 +173,11 @@ async function main() {
   console.log('Distributed Rate Limiter — Load Tests');
   console.log(`Target: ${BASE_URL}`);
   console.log('Make sure the server is running and Redis is connected.\n');
-  console.log('NOTE: Tests 1 & 2 share the same sliding window.');
-  console.log('For accurate results, flush Redis (FLUSHDB) between test runs.\n');
+  console.log(`Run ID: ${RUN_ID} — each test runs as its own registered tenant (plan '${PLAN}', limit ${MAX_LIMIT}).\n`);
 
   try {
+    keys = await provisionKeys(TENANT_PREFIX, TESTS, PLAN);
     await strictCorrectnessTest();
-
-    // Brief pause to let the sliding window roll over slightly
-    console.log('\n--- Waiting 5s before concurrency test ---');
-    await new Promise(r => setTimeout(r, 5000));
-
     await strictConcurrencyTest();
     await looseThroughputTest();
     await tokenBucketCorrectnessTest();
@@ -163,6 +187,8 @@ async function main() {
   } catch (err) {
     console.error('Test failed:', err.message);
     process.exit(1);
+  } finally {
+    await cleanupKeys(TENANT_PREFIX, keys).catch((err) => console.warn('Cleanup failed:', err.message));
   }
 
   console.log('\n=== Test 8: Fail-Open (manual) ===');

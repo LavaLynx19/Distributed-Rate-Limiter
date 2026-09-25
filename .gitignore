@@ -25,3 +25,6 @@ go/vendor/
 
 # Logs
 *.log
+
+# Raw benchmark output (bench/docker-bench.sh); curated numbers live in the RESULTS.md files
+bench/results/

@@ -1,0 +1,142 @@
+# Two stacks, see ARCHITECTURE.md section 9.
+#
+#   docker compose up -d --build          default: shared Redis, both gateways, nginx
+#   bench/docker-bench.sh                 bench profile: isolated, CPU-pinned runs
+name: rate-limiter
+
+x-node-build: &node-build
+  context: .
+  dockerfile: node/Dockerfile
+
+x-go-build: &go-build
+  context: .
+  dockerfile: go/Dockerfile
+
+# Node's image has node but no curl; distroless Go has no shell at all, so
+# only the Node gateway gets an in-container healthcheck.
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/open/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+  interval: 2s
+  timeout: 2s
+  retries: 15
+
+x-redis-command: &redis-command
+  ["redis-server", "--save", "", "--appendonly", "no"]
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          # Dynamic addresses come from the upper half only, so nothing else
+          # can ever be handed nginx's fixed .10.
+          ip_range: 172.28.0.128/25
+  bench: {}
+
+services:
+  # ---------------------------------------------------------------- default
+  redis:
+    image: redis:8.6
+    command: *redis-command
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  node:
+    build: *node-build
+    image: rate-limiter-node
+    environment: &gateway-env
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-100}
+      # nginx's address only — not the subnet. Any other container on this
+      # network could forge X-Forwarded-For, and the source address of host
+      # connections to published ports varies by platform (192.168.65.1 on
+      # Docker Desktop; possibly the in-subnet bridge gateway elsewhere).
+      TRUST_PROXY: 172.28.0.10
+      PORT: "3000"
+    ports: ["3000:3000"]
+    networks: [edge]
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck: *node-healthcheck
+
+  go:
+    build: *go-build
+    image: rate-limiter-go
+    environment:
+      <<: *gateway-env
+      PORT: "3001"
+    ports: ["3001:3001"]
+    networks: [edge]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  nginx:
+    image: nginx:1.29-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:8080", "8081:8081", "8082:8082"]
+    networks:
+      edge:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      node: { condition: service_healthy }
+      go: { condition: service_started }
+
+  # ------------------------------------------------------------------ bench
+  # Isolated from the default stack: own network, own Redis, no proxy.
+  # cpusets are vCPUs inside Docker Desktop's VM (14 on this machine).
+  redis-bench:
+    profiles: [bench]
+    image: redis:8.6
+    command: *redis-command
+    cpuset: "0"
+    networks: [bench]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  node-bench:
+    profiles: [bench]
+    image: rate-limiter-node
+    build: *node-build
+    environment: &bench-env
+      REDIS_HOST: redis-bench
+      REDIS_PORT: "6379"
+      # High enough that every request is admitted, so both gateways do the
+      # full amount of work (same method as the native admit-path runs).
+      # Keyed runs use a tenant on the 'bench' plan with the same ceiling.
+      RATE_LIMIT_MAX: ${BENCH_LIMIT:-100000000}
+      PLAN_LIMITS: free=100,paid=1000,bench=${BENCH_LIMIT:-100000000}
+      PORT: "3000"
+    cpuset: "1-4"
+    networks: [bench]
+    depends_on:
+      redis-bench: { condition: service_healthy }
+
+  go-bench:
+    profiles: [bench]
+    image: rate-limiter-go
+    build: *go-build
+    environment:
+      <<: *bench-env
+      PORT: "3001"
+    cpuset: "1-4"
+    networks: [bench]
+    depends_on:
+      redis-bench: { condition: service_healthy }
+
+  loadgen:
+    profiles: [bench]
+    image: rate-limiter-loadgen
+    build:
+      context: .
+      dockerfile: bench/Dockerfile
+    cpuset: "5-13"
+    networks: [bench]
