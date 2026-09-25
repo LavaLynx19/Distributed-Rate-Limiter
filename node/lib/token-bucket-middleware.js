@@ -1,11 +1,13 @@
 import { checkTokenBucket } from './token-bucket.js';
-import { extractIdentifier } from './identifier.js';
+import { identify } from './identifier.js';
 import { setRateLimitHeaders, setBlockedHeaders } from './headers.js';
 import { config } from './config.js';
 
 export function tokenBucketRateLimiter() {
   return async (req, res, next) => {
-    const identifier = extractIdentifier(req);
+    // Same identity as the sliding window; the bucket keeps its global
+    // capacity, which protects backend capacity rather than a billing plan.
+    const { id: identifier } = await identify(req);
     const result = await checkTokenBucket(identifier);
 
     if (result.failedOpen) {

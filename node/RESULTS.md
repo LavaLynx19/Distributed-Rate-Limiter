@@ -1,6 +1,32 @@
-# Distributed Rate Limiter — Results
+# Distributed Rate Limiter — Results (Node)
 
-A distributed rate-limiting API gateway built with Express + Redis, implementing three algorithms (Sliding Window Counter, Token Bucket, Leaky Bucket) across two enforcement modes (Strict and Loose). All rate-limit logic runs atomically inside Redis via Lua scripts.
+A distributed rate-limiting API gateway built with Express + Redis, implementing three algorithms (Sliding Window Counter, Token Bucket, Leaky Bucket) across two enforcement modes (Strict and Loose). All rate-limit logic runs atomically inside Redis via the shared Lua scripts in [`../lua`](../lua).
+
+**Test environment:** macOS 26.6.2, Apple M4 Pro (14 cores), Node v25.9.0, Redis 8.6.2 local, autocannon; Docker runs on Docker Desktop 29.4 (Linux VM, 14 vCPUs)
+**Date:** 2026-09-25. Supersedes the 2026-03-28 results, which were measured with the bugs listed below.
+
+---
+
+## Bugs fixed in this revision
+
+An audit prompted by the Go port's benchmark found these. Each was verified end to end after the fix.
+
+| # | Bug | Impact before | Verified after |
+|---|---|---|---|
+| B1 | Loose mode zeroed its only counter on every flush, so the local `> maxLimit` guard could never fire | Loose mode admitted **71,622** requests against a limit of 100 in 10s | Admits exactly **100** |
+| B2 | `retryStrategy` returned `null` after 3 attempts, which closes the ioredis client for good | Any Redis outage longer than ~1.2s, or Redis down at boot, left rate limiting **off** until a restart | Reconnects within ~1s of Redis returning, from both scenarios, with no restart |
+| B3 | Load test 2 ("atomicity") reused test 1's already-exhausted window and asserted `ok <= 100` | Admitted 0, so the check could never fail and **atomicity was never actually tested** | Fresh identifier; exactly 100 of 200 concurrent requests admitted |
+| B4 | `trust proxy: true` let any client choose its identity via `X-Forwarded-For` | 105 requests with random XFF headers: **all 105 admitted** | Off by default (`TRUST_PROXY`); 100 admitted, 5 rejected |
+| B5 | Loose mode counted rejected requests and flushed them to Redis | A blocked client kept burning its own future quota | Only admitted requests are counted |
+| B6 | Shutdown stopped the flush loop without writing counts still pending | Up to one batch per identifier lost on every deploy | 6/6 trials: 0 in Redis before SIGTERM, 30 after |
+| B7 | A flush that failed open dropped its batch | Requests served during a Redis blip were never recorded | The batch goes back into `pending` and is retried |
+| B8 | Each strict request created a 5ms timer that was never cleared | Timer churn on the hot path | Timer cleared; strict throughput **+13%** in an interleaved A/B (43.0k → 48.7k RPS, 3 pairs) |
+| B9 | A client was two identities: `::ffff:a.b.c.d` on a direct connection and `a.b.c.d` through a proxy (found in the Docker stack) | Alternating between the direct port and nginx gave **2× the quota** | IPv4-mapped addresses normalized; 100 admitted in total |
+| B10 | Loose write-backs were all-or-nothing, and a blocked identifier never re-checked Redis (found in the Docker stack) | Two instances sharing a quota: 153 admitted but **only 77 recorded**; blocked up to 300 s after capacity freed | `writeback` Lua mode records every served request; allowance synced to Redis; unblocks in ~4 s (ARCHITECTURE.md §6) |
+
+B4, B5, B6, B7, B9 and B10 were also present in the Go port and are fixed there too.
+
+**Known limitation, not yet fixed:** `X-API-Key` and `Authorization` values are trusted as identifiers without validation, so a client that rotates keys gets a fresh quota each time. A key registry is the next planned change (PLAN.md).
 
 ---
 
@@ -16,59 +42,63 @@ A distributed rate-limiting API gateway built with Express + Redis, implementing
 
 ---
 
-## Performance Results
+## Correctness Tests
 
-**Test environment:** macOS Darwin 25.3.0, M4 Pro, Node.js, Redis local, autocannon
-**Date:** 2026-03-28
+`npm run test:load`, with each test on its own identifier.
 
-### Correctness Tests
+| Test | Algorithm | Requests | Expected | Actual | Result |
+|---|---|---|---|---|---|
+| 1. Strict correctness | Sliding Window | 150 sequential | 100 × 2xx, 50 × 4xx | 100 / 50 | **PASS** |
+| 2. Strict concurrency | Sliding Window | 200 × 10 conn, fresh window | exactly 100 × 2xx | 100 / 100 | **PASS** |
+| 3. Loose local guard | Sliding Window | 797,609 over 10s | ≤ 100 × 2xx | 100 | **PASS** |
+| 4. Token bucket correctness | Token Bucket | 15 sequential | 10 × 2xx, 5 × 4xx | 10 / 5 | **PASS** |
+| 5. Token bucket refill | Token Bucket | 5 after 5s | 5 × 2xx | 5 | **PASS** |
+| 6. Leaky bucket correctness | Leaky Bucket | 15 sequential | 10 × 2xx, 5 × 4xx | 10 / 5 | **PASS** |
+| 7. Leaky bucket drain | Leaky Bucket | 5 after 5s | 5 × 2xx | 5 | **PASS** |
 
-| Test | Algorithm | Requests | Expected 2xx | Actual 2xx | Expected 4xx | Actual 4xx | Result |
-|---|---|---|---|---|---|---|---|
-| Strict Correctness | Sliding Window | 150 sequential | 100 | 100 | 50 | 50 | **PASS** |
-| Strict Concurrency | Sliding Window | 200 × 10 conn | 0* | 0 | 200 | 200 | **PASS** |
-| Token Bucket Correctness | Token Bucket | 15 sequential | 10 | 10 | 5 | 5 | **PASS** |
-| Token Bucket Refill | Token Bucket | 5 after 5s wait | 5 | 5 | 0 | 0 | **PASS** |
-| Leaky Bucket Correctness | Leaky Bucket | 15 sequential | 10 | 10 | 5 | 5 | **PASS** |
-| Leaky Bucket Drain | Leaky Bucket | 5 after 5s wait | 5 | 5 | 0 | 0 | **PASS** |
+Also verified by hand: fail-open with Redis absent (all requests allowed), and reconnect after a 5s Redis outage (enforcement resumed at exactly 100/5).
 
-*\*Concurrency test runs after correctness test — all 100 slots already consumed from the shared sliding window.*
+## Latency (from the test suite)
 
-**Lua Atomicity:** PASS — no over-admission observed under 10 concurrent connections.
+| Test | p50 | p97.5 | p99 | Avg | Max |
+|---|---|---|---|---|---|
+| Strict (sequential) | 0 ms | 1 ms | 4 ms | 0.10 ms | 6 ms |
+| Strict (10 conn) | 0 ms | 3 ms | 3 ms | 0.44 ms | 4 ms |
+| Loose (50 conn, pipelined ×10) | 8 ms | 9 ms | 10 ms | 6.52 ms | 118 ms |
+| Token bucket | 0 ms | 7 ms | 7 ms | 0.47 ms | 7 ms |
+| Leaky bucket | 0 ms | 3 ms | 3 ms | 0.27 ms | 3 ms |
 
-### Latency
+## Throughput — admit path
 
-| Mode | p2.5 | p50 | p97.5 | p99 | Avg | Max |
-|---|---|---|---|---|---|---|
-| Strict (sequential) | 0 ms | 0 ms | 0 ms | 0 ms | 0.03 ms | 4 ms |
-| Strict (10 conn) | 0 ms | 0 ms | 5 ms | 6 ms | 0.54 ms | 7 ms |
-| Loose (50 conn, pipelined) | 4 ms | 8 ms | 9 ms | 11 ms | 6.72 ms | 88 ms |
-| Token Bucket | 0 ms | 0 ms | 11 ms | 11 ms | 0.74 ms | 11 ms |
-| Leaky Bucket | 0 ms | 0 ms | 2 ms | 2 ms | 0.14 ms | 2 ms |
+`RATE_LIMIT_MAX=100000000`, so every request is admitted and does the full amount of work. 3 interleaved runs, median reported. There were no errors, timeouts or non-2xx responses in any run.
 
-### Throughput — Loose Mode
+**Native (macOS), autocannon, 50 connections:**
 
-| Metric | Value |
-|---|---|
-| Connections | 50 (pipelined ×10) |
-| Duration | 10 seconds |
-| Total Requests | 761,000 |
-| Avg RPS | **69,162** |
-| 2xx Responses | 70,084 |
-| 4xx Responses | 690,687 |
-| Data Read | 298 MB |
-| p99 Latency | 11 ms |
-| Latency Target (<5ms p99) | Above target* |
+| Mode | Runs (RPS) | Median RPS | p99 | Gateway CPU |
+|---|---|---|---|---|
+| Strict | 44,097 / 42,922 / 49,564 | **44,097** | 1 ms | ~99% of one core |
+| Loose (pipelined ×10) | 73,097 / 73,121 / 76,128 | **73,121** | 11 ms | ~100% of one core |
 
-*\*The 11ms p99 under 50 pipelined connections is due to the pipelining factor (10 requests per connection batch). Under realistic single-request concurrency, p99 would be significantly lower. The heap-buffer path itself is sub-microsecond.*
+**Docker (Linux), Redis, gateway and load generator pinned to separate vCPUs:**
 
-### Observations
+| Tool | Mode | Median RPS | p99 | Gateway CPU | Redis CPU |
+|---|---|---|---|---|---|
+| autocannon | Strict | **47,008** | 2 ms | 100% | 45% |
+| autocannon | Loose | **69,160** | 10 ms | 101% | 1% |
+| wrk (200 conn) | Strict | **42,927** | 7.4 ms | 102% | 40% |
+| wrk (200 conn) | Loose | **50,504** | 5.7 ms | 101% | 1% |
 
-1. **Strict mode latency is excellent** — p50 at 0ms, p99 at 6ms under concurrency. Well within the 5ms budget for individual requests.
-2. **Lua atomicity is verified** — 10 concurrent connections produced zero over-admissions.
-3. **Loose mode achieves ~69K RPS** — the in-memory heap buffer avoids Redis round-trips on the hot path.
-4. **Token/Leaky bucket algorithms are sub-millisecond** — single hash key per user means minimal Redis overhead.
-5. **Refill/drain mechanics work correctly** — both algorithms properly restore capacity after idle periods.
+---
+
+## Observations
+
+1. **Node is bound by its single event loop everywhere.** The gateway sits at ~100% of one core in every configuration, native and Docker, while Redis stays at ~40–48%. That's why its throughput barely changes between environments.
+2. **Strict latency is well inside the 5ms budget** at up to 10 concurrent connections (p99 3–4 ms). At 200 connections (wrk) p99 reaches 7.4 ms, with rare stalls up to ~250 ms.
+3. **Loose mode misses the <5ms p99 target under pipelined load** (p99 10–11 ms). The in-process decision is sub-microsecond; the tail comes from a saturated event loop queueing requests.
+4. **Atomicity and the local guard are now actually demonstrated.** 200 concurrent requests on a fresh window admitted exactly 100. Loose mode admits exactly 100 on one instance, and records every served request when sharing a quota with the Go gateway.
+5. **Scaling Node means more processes.** A cluster of workers, or more instances behind the proxy, now share one quota correctly, which is what the B10 fix guarantees.
+
+For the Go comparison and the full Docker analysis, see [`../go/RESULTS.md`](../go/RESULTS.md).
 
 ---
 
@@ -77,7 +107,5 @@ A distributed rate-limiting API gateway built with Express + Redis, implementing
 <!-- Add screenshot: Terminal output of `npm run test:load` showing all PASS results -->
 
 <!-- Add screenshot: Redis MONITOR output during strict mode test showing Lua EVALSHA calls -->
-
-<!-- Add screenshot: Grafana or similar dashboard showing request rate and latency during load test -->
 
 <!-- Add screenshot: `GET /api/open/stats` response showing heap buffer state during loose mode test -->

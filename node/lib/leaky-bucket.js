@@ -1,13 +1,8 @@
 import { redis, isRedisHealthy } from './redis-client.js';
 import { config } from './config.js';
+import { withTimeout } from './with-timeout.js';
 
 const TIMEOUT_MS = config.redis.commandTimeout;
-
-function timeoutPromise(ms) {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('Leaky bucket check timed out')), ms);
-  });
-}
 
 export async function checkLeakyBucket(identifier) {
   if (!isRedisHealthy()) {
@@ -15,10 +10,11 @@ export async function checkLeakyBucket(identifier) {
   }
 
   try {
-    const result = await Promise.race([
+    const result = await withTimeout(
       redis.leakyBucketCheck(identifier, config.leakyBucket.capacity, config.leakyBucket.leakRate),
-      timeoutPromise(TIMEOUT_MS),
-    ]);
+      TIMEOUT_MS,
+      'Leaky bucket check',
+    );
 
     const [status, remaining, ttl] = result;
     return {

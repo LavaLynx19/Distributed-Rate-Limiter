@@ -6,4 +6,4 @@ Modes: Strict (synchronous Redis for billing/monetization). Loose (local heap bu
 
 Constraints: Interception logic <5ms latency. Fail-Open if Redis is down — allow the request.
 
-Key refs: ARCHITECTURE.md for Mermaid sequence flows. node/README.md for Node.js implementation details. node/lua/sliding_window.lua is the shared atomic core — both modes use it.
+Key refs: ARCHITECTURE.md for Mermaid sequence flows. node/README.md for Node.js implementation details. lua/sliding_window.lua is the shared atomic core — both modes and both language implementations use it. go/README.md for Go implementation details.

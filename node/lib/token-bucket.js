@@ -1,13 +1,8 @@
 import { redis, isRedisHealthy } from './redis-client.js';
 import { config } from './config.js';
+import { withTimeout } from './with-timeout.js';
 
 const TIMEOUT_MS = config.redis.commandTimeout;
-
-function timeoutPromise(ms) {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('Token bucket check timed out')), ms);
-  });
-}
 
 export async function checkTokenBucket(identifier) {
   if (!isRedisHealthy()) {
@@ -15,10 +10,11 @@ export async function checkTokenBucket(identifier) {
   }
 
   try {
-    const result = await Promise.race([
+    const result = await withTimeout(
       redis.tokenBucketCheck(identifier, config.tokenBucket.capacity, config.tokenBucket.refillRate),
-      timeoutPromise(TIMEOUT_MS),
-    ]);
+      TIMEOUT_MS,
+      'Token bucket check',
+    );
 
     const [status, remaining, ttl] = result;
     return {
