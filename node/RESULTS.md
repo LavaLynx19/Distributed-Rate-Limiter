@@ -3,7 +3,7 @@
 A distributed rate-limiting API gateway built with Express + Redis, implementing three algorithms (Sliding Window Counter, Token Bucket, Leaky Bucket) across two enforcement modes (Strict and Loose). All rate-limit logic runs atomically inside Redis via the shared Lua scripts in [`../lua`](../lua).
 
 **Test environment:** macOS 26.6.2, Apple M4 Pro (14 cores), Node v25.9.0, Redis 8.6.2 local, autocannon; Docker runs on Docker Desktop 29.4 (Linux VM, 14 vCPUs)
-**Date:** 2026-09-25. Supersedes the 2026-03-28 results, which were measured with the bugs listed below.
+**Date:** 2026-09-25, final run on the committed code (write-back protocol, exact Retry-After, API-key registry). Supersedes the 2026-03-28 results, which were measured with the bugs listed below.
 
 ---
 
@@ -24,9 +24,10 @@ An audit prompted by the Go port's benchmark found these. Each was verified end 
 | B9 | A client was two identities: `::ffff:a.b.c.d` on a direct connection and `a.b.c.d` through a proxy (found in the Docker stack) | Alternating between the direct port and nginx gave **2× the quota** | IPv4-mapped addresses normalized; 100 admitted in total |
 | B10 | Loose write-backs were all-or-nothing, and a blocked identifier never re-checked Redis (found in the Docker stack) | Two instances sharing a quota: 153 admitted but **only 77 recorded**; blocked up to 300 s after capacity freed | `writeback` Lua mode records every served request; allowance synced to Redis; unblocks in ~4 s (ARCHITECTURE.md §6) |
 
-B4, B5, B6, B7, B9 and B10 were also present in the Go port and are fixed there too.
+| B11 | Any `X-API-Key` / `Authorization` value became an identity with a fresh quota | Rotating made-up keys bypassed every limit | Keys are validated against a registry (ARCHITECTURE.md §10); unregistered keys fall back to IP identity. 105 requests with fresh made-up keys: 100 admitted, 5 rejected |
+| B12 | Retry-After came from the oldest key's TTL, defaulting to 60 s; loose mode always said 60 s | Clients were told to wait up to 60 s too long or too short | Computed from segment exit times; exact in tests (81 s against an expected 81) |
 
-**Known limitation, not yet fixed:** `X-API-Key` and `Authorization` values are trusted as identifiers without validation, so a client that rotates keys gets a fresh quota each time. A key registry is the next planned change (PLAN.md).
+B4, B5, B6, B7, B9, B10, B11 and B12 were also present in the Go port and are fixed there too.
 
 ---
 
@@ -44,13 +45,13 @@ B4, B5, B6, B7, B9 and B10 were also present in the Go port and are fixed there 
 
 ## Correctness Tests
 
-`npm run test:load`, with each test on its own identifier.
+`npm run test:load`. The harness provisions one registered tenant per test, so tests are isolated. Unit tests (`npm test`): 24 passing, mutation-checked.
 
 | Test | Algorithm | Requests | Expected | Actual | Result |
 |---|---|---|---|---|---|
 | 1. Strict correctness | Sliding Window | 150 sequential | 100 × 2xx, 50 × 4xx | 100 / 50 | **PASS** |
 | 2. Strict concurrency | Sliding Window | 200 × 10 conn, fresh window | exactly 100 × 2xx | 100 / 100 | **PASS** |
-| 3. Loose local guard | Sliding Window | 797,609 over 10s | ≤ 100 × 2xx | 100 | **PASS** |
+| 3. Loose local guard | Sliding Window | 774,743 over 10s | ≤ 100 × 2xx | 100 | **PASS** |
 | 4. Token bucket correctness | Token Bucket | 15 sequential | 10 × 2xx, 5 × 4xx | 10 / 5 | **PASS** |
 | 5. Token bucket refill | Token Bucket | 5 after 5s | 5 × 2xx | 5 | **PASS** |
 | 6. Leaky bucket correctness | Leaky Bucket | 15 sequential | 10 × 2xx, 5 × 4xx | 10 / 5 | **PASS** |
@@ -62,41 +63,47 @@ Also verified by hand: fail-open with Redis absent (all requests allowed), and r
 
 | Test | p50 | p97.5 | p99 | Avg | Max |
 |---|---|---|---|---|---|
-| Strict (sequential) | 0 ms | 1 ms | 4 ms | 0.10 ms | 6 ms |
-| Strict (10 conn) | 0 ms | 3 ms | 3 ms | 0.44 ms | 4 ms |
-| Loose (50 conn, pipelined ×10) | 8 ms | 9 ms | 10 ms | 6.52 ms | 118 ms |
-| Token bucket | 0 ms | 7 ms | 7 ms | 0.47 ms | 7 ms |
-| Leaky bucket | 0 ms | 3 ms | 3 ms | 0.27 ms | 3 ms |
+| Strict (sequential) | 0 ms | 0 ms | 0 ms | 0.02 ms | 3 ms |
+| Strict (10 conn) | 0 ms | 3 ms | 3 ms | 0.25 ms | 3 ms |
+| Loose (50 conn, pipelined ×10) | 8 ms | 10 ms | 10 ms | 6.59 ms | 133 ms |
+| Token bucket | 0 ms | 6 ms | 6 ms | 0.40 ms | 6 ms |
+| Leaky bucket | 0 ms | 3 ms | 3 ms | 0.20 ms | 3 ms |
 
 ## Throughput — admit path
 
-`RATE_LIMIT_MAX=100000000`, so every request is admitted and does the full amount of work. 3 interleaved runs, median reported. There were no errors, timeouts or non-2xx responses in any run.
+Every limit is set to 1e8, so every request is admitted and does the full amount of work. 3 interleaved runs, median reported.
 
-**Native (macOS), autocannon, 50 connections:**
+**Native (macOS), autocannon, 50 connections, anonymous:**
 
 | Mode | Runs (RPS) | Median RPS | p99 | Gateway CPU |
 |---|---|---|---|---|
-| Strict | 44,097 / 42,922 / 49,564 | **44,097** | 1 ms | ~99% of one core |
-| Loose (pipelined ×10) | 73,097 / 73,121 / 76,128 | **73,121** | 11 ms | ~100% of one core |
+| Strict | 45,430 / 47,897 / 43,344 | **45,430** | 1 ms | ~99% of one core |
+| Loose (pipelined ×10) | 78,729 / 79,119 / 76,576 | **78,729** | 9 ms | ~100% of one core |
 
 **Docker (Linux), Redis, gateway and load generator pinned to separate vCPUs:**
 
-| Tool | Mode | Median RPS | p99 | Gateway CPU | Redis CPU |
-|---|---|---|---|---|---|
-| autocannon | Strict | **47,008** | 2 ms | 100% | 45% |
-| autocannon | Loose | **69,160** | 10 ms | 101% | 1% |
-| wrk (200 conn) | Strict | **42,927** | 7.4 ms | 102% | 40% |
-| wrk (200 conn) | Loose | **50,504** | 5.7 ms | 101% | 1% |
+| Tool | Mode | Anonymous RPS | Registered-key RPS | Key cost | p99 (anon / keyed) | Gateway CPU |
+|---|---|---|---|---|---|---|
+| autocannon | Strict | **48,538** | **43,449** | −10% | 1 / 2 ms | ~100% |
+| autocannon | Loose | **70,065** | **63,804** | −9% | 9 / 12 ms | ~101% |
+| wrk (200 conn) | Strict | **43,976** | **39,609** | −10% | 7.0 / 7.9 ms | ~101% |
+| wrk (200 conn) | Loose | **50,191** | **45,482** | −9% | 7.1 / 6.7 ms | ~101% |
+
+There were no errors, timeouts or non-2xx responses in any run.
 
 ---
 
 ## Observations
 
-1. **Node is bound by its single event loop everywhere.** The gateway sits at ~100% of one core in every configuration, native and Docker, while Redis stays at ~40–48%. That's why its throughput barely changes between environments.
-2. **Strict latency is well inside the 5ms budget** at up to 10 concurrent connections (p99 3–4 ms). At 200 connections (wrk) p99 reaches 7.4 ms, with rare stalls up to ~250 ms.
-3. **Loose mode misses the <5ms p99 target under pipelined load** (p99 10–11 ms). The in-process decision is sub-microsecond; the tail comes from a saturated event loop queueing requests.
-4. **Atomicity and the local guard are now actually demonstrated.** 200 concurrent requests on a fresh window admitted exactly 100. Loose mode admits exactly 100 on one instance, and records every served request when sharing a quota with the Go gateway.
-5. **Scaling Node means more processes.** A cluster of workers, or more instances behind the proxy, now share one quota correctly, which is what the B10 fix guarantees.
+1. **Node is bound by its single event loop everywhere.** The gateway sits at ~100% of one core in every configuration, native and Docker, while Redis stays at ~41–51%. That's why its throughput barely changes between environments.
+2. **A registered API key costs ~10%.** Each request hashes the key (SHA-256) and awaits the resolver. Both are cheap, but they land on the one saturated core. Go shows no measurable cost for the same work (see [`../go/RESULTS.md`](../go/RESULTS.md#cost-of-a-registered-api-key)). Caching by raw key would skip the hash; that's a possible optimization, not implemented.
+3. **Strict latency is well inside the 5ms budget** at up to 10 concurrent connections (p99 3 ms). At 200 connections (wrk) p99 reaches ~7–8 ms, with rare stalls up to ~300 ms.
+4. **Loose mode misses the <5ms p99 target under load** (p99 7–12 ms). The in-process decision is sub-microsecond; the tail comes from a saturated event loop queueing requests.
+5. **Correctness is now demonstrated, not assumed:**
+   - 200 concurrent requests on a fresh window admitted exactly 100.
+   - Loose mode admits exactly 100 on one instance, and records every served request when sharing a quota with the Go gateway.
+   - Made-up keys no longer mint quotas.
+6. **Scaling Node means more processes.** A cluster of workers, or more instances behind the proxy, now share one quota correctly.
 
 For the Go comparison and the full Docker analysis, see [`../go/RESULTS.md`](../go/RESULTS.md).
 
