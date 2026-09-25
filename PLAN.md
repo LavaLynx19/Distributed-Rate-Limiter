@@ -75,4 +75,4 @@
   - [x] Verify: rotation bypass closed, pooled vs isolated quotas, plan limits, revocation within cache TTL, Redis-down fallback
 - [x] Install golangci-lint and make `golangci-lint run` clean
 - [x] Node unit tests with the built-in `node:test` (no new dependency): 24 tests; buffer split into injectable `lib/buffer-core.js`; mutation-checked
-- [ ] Final re-benchmark: registry lookups and Reset calculation change both hot paths
+- [x] Final re-benchmark: native + Docker, anonymous and registered-key runs (go/RESULTS.md, node/RESULTS.md)
